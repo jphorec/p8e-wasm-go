@@ -3,11 +3,13 @@ package command
 import (
 	"C"
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/wasmerio/wasmer-go/wasmer"
 	"io/ioutil"
 	"log"
+
+	"github.com/spf13/cobra"
+	"github.com/wasmerio/wasmer-go/wasmer"
 )
+import "bytes"
 
 func RunCmd() *cobra.Command {
 	return &cobra.Command{
@@ -25,8 +27,9 @@ func RunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for export, _ := range module.Exports() {
-				log.Printf("exported:%+v", export)
+			log.Println("Exports are:")
+			for _, exp := range module.Exports() {
+				log.Printf("exported:%s", exp.Name())
 			}
 
 			importObj := wasmer.NewImportObject()
@@ -34,19 +37,62 @@ func RunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
 			log.Printf("%+v\n", instance)
-			greet, err := instance.Exports.GetFunction("greet")
+
+			err = greet(instance, "test")
 			if err != nil {
-				return err
+				log.Printf("Error greeting: %v", err)
 			}
-			result, err := greet(C.CString("test"))
+			err = add(instance)
 			if err != nil {
-				return err
+				log.Printf("Error adding: %v", err)
 			}
-			fmt.Printf("%+v\n", result)
 
 			return nil
 		},
 	}
+}
+
+func greet(instance *wasmer.Instance, name string) error {
+	greet, err := instance.Exports.GetFunction("greet")
+	if err != nil {
+		return err
+	}
+
+	memory, err := instance.Exports.GetMemory("memory")
+	if err != nil {
+		return err
+	}
+	data := memory.Data()
+	copy(data, name)
+	fmt.Printf("about to greet: %s\n", string(data[:len(name)]))
+
+	result, err := greet(0)
+	if err != nil {
+		return err
+	}
+
+	data = memory.Data()
+
+	fmt.Printf("result pointer: %d\n", result.(int32))
+	idx := result.(int32)
+	idxNull := int32(bytes.IndexByte(data[idx:], byte(0)))
+	fmt.Printf("greet result: %s\n", string(data[idx:idx+idxNull]))
+
+	return nil
+}
+
+func add(instance *wasmer.Instance) error {
+	doAdd, err := instance.Exports.GetFunction("add")
+	if err != nil {
+		return err
+	}
+
+	result, err := doAdd(1, 2)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("add result: %+v\n", result)
+
+	return nil
 }
