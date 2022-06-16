@@ -1,16 +1,22 @@
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use wasm_bindgen::prelude::wasm_bindgen;
+use p8e_attributes::{contract, function};
+use proto::hello::{Hello, HelloResponse};
+use protobuf::Message;
 
-#[no_mangle]
-pub extern "C" fn greet(name: *const c_char) -> *mut i8 {
-    let name_str = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+mod proto;
 
-    let c_str = CString::new(format!("Hello, {}!", name_str)).unwrap();
-    c_str.into_raw()
+#[function(name = "test-record", invoked_by = "OWNER")]
+fn greet_me(
+    #[input(name = "proposedRecord")] proposed: proto::hello::Hello,
+    #[record(name = "existingRecord")] existing: Hello,
+    #[record(name = "existingOptionalRecord", optional = true)] existing_optional: Hello,
+) -> HelloResponse {
+    let mut response = HelloResponse::new();
+    // response.request = request;
+    response.response = format!(
+        "Hi (proposed: {}, existing: {}, existing_optional: {})",
+        proposed.name, existing.name, existing_optional.name
+    );
+    response
 }
 
-#[wasm_bindgen]
-pub fn add(a: i32, b: i32) -> i32 {
-    return a + b;
-}
+contract!();

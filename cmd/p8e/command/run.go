@@ -8,8 +8,33 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wasmerio/wasmer-go/wasmer"
+
+	"github.com/gogo/protobuf/proto"
+	"github.com/provenance-io/p8e-wasm-go/cmd/p8e/command/hello"
 )
-import "bytes"
+import (
+	"encoding/binary"
+	"encoding/json"
+)
+
+type RecordType string
+
+const (
+	Proposed RecordType = "Proposed"
+	Existing RecordType = "Existing"
+)
+
+type P8eFunctionParamter struct {
+	RecordType RecordType `json:"record_type"`
+	Name       string     `json:"name"`
+	Optional   bool       `json:"optional"`
+	Type       string     `json:"type"`
+}
+
+type P8eFunction struct {
+	Name       string                `json:"name"`
+	Parameters []P8eFunctionParamter `json:"parameters"`
+}
 
 func RunCmd() *cobra.Command {
 	return &cobra.Command{
@@ -37,15 +62,38 @@ func RunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			log.Printf("%+v\n", instance)
 
-			err = greet(instance, "test")
+			log.Println("p8e functions are")
+			p8eTable, err := instance.Exports.GetGlobal("__P8E_FUNCTIONS")
 			if err != nil {
-				log.Printf("Error greeting: %v", err)
+				return err
 			}
-			err = add(instance)
+			value, _ := p8eTable.Get()
+			memory, err := instance.Exports.GetMemory("memory")
 			if err != nil {
-				log.Printf("Error adding: %v", err)
+				return err
+			}
+			data := memory.Data()
+			tbl := value.(int32)
+			ptr := binary.LittleEndian.Uint32(data[tbl : tbl+4])
+			p8eTableLenG, err := instance.Exports.GetGlobal("__P8E_FUNCTIONS_LENGTH")
+			value, _ = p8eTableLenG.Get()
+			p8eTableLen := value.(int32)
+			p8eTableLenValue := binary.LittleEndian.Uint32(data[p8eTableLen : p8eTableLen+4])
+			p8eTableValue := string(data[ptr : ptr+p8eTableLenValue])
+			log.Printf("p8e function table len: %d\n", p8eTableLenValue)
+			log.Printf("p8e function table: %s\n", p8eTableValue)
+			var functionTable []P8eFunction
+			err = json.Unmarshal([]byte(p8eTableValue), &functionTable)
+			if err != nil {
+				return err
+			}
+			indented, err := json.MarshalIndent(functionTable, "", " ")
+			log.Printf("function table: %s", indented)
+
+			err = greetMe(instance, "your majesty")
+			if err != nil {
+				log.Printf("Error greeting via binary proto: %v", err)
 			}
 
 			return nil
@@ -53,8 +101,35 @@ func RunCmd() *cobra.Command {
 	}
 }
 
-func greet(instance *wasmer.Instance, name string) error {
-	greet, err := instance.Exports.GetFunction("greet")
+type Allocation struct {
+	data interface{}
+	len  int32
+}
+
+func allocateNameRequest(name string, allocator func(...interface{}) (interface{}, error), memory *wasmer.Memory) (*Allocation, error) {
+	nameRequest := hello.Hello{
+		Name: name,
+	}
+	nameRequestBytes, err := proto.Marshal(&nameRequest)
+	if err != nil {
+		return nil, err
+	}
+	dataLen := len(nameRequestBytes)
+	ptr, err := allocator(dataLen)
+	if err != nil {
+		return nil, err
+	}
+	data := memory.Data()
+	copy(data[ptr.(int32):], nameRequestBytes) // put name proto in wasm memory
+
+	return &Allocation{
+		data: ptr,
+		len:  int32(dataLen),
+	}, nil
+}
+
+func greetMe(instance *wasmer.Instance, name string) error {
+	greetProto, err := instance.Exports.GetFunction("__p8e_entrypoint_greet_me")
 	if err != nil {
 		return err
 	}
@@ -63,36 +138,58 @@ func greet(instance *wasmer.Instance, name string) error {
 	if err != nil {
 		return err
 	}
-	data := memory.Data()
-	copy(data, name)
-	fmt.Printf("about to greet: %s\n", string(data[:len(name)]))
 
-	result, err := greet(0)
+	allocator, err := instance.Exports.GetFunction("p8e_allocate")
 	if err != nil {
 		return err
 	}
 
-	data = memory.Data()
+	// allocate
+	proposed, err := allocateNameRequest("proposed name", allocator, memory)
+	if err != nil {
+		return err
+	}
+	existing, err := allocateNameRequest("existing name", allocator, memory)
+	if err != nil {
+		return err
+	}
+	existingOptional, err := allocateNameRequest("existing optional", allocator, memory)
+	if err != nil {
+		return err
+	}
+
+	// execute
+	result, err := greetProto(proposed.data, proposed.len, existing.data, existing.len, existingOptional.data, existingOptional.len)
+	if err != nil {
+		return err
+	}
+
+	data := memory.Data() // refresh data ptr as might have grown
 
 	fmt.Printf("result pointer: %d\n", result.(int32))
-	idx := result.(int32)
-	idxNull := int32(bytes.IndexByte(data[idx:], byte(0)))
-	fmt.Printf("greet result: %s\n", string(data[idx:idx+idxNull]))
+	resPtr := result.(int32)
+	resDataLen := int32(binary.LittleEndian.Uint32(data[resPtr:]))
+	responseMsg := hello.HelloResponse{}
+	proto.Unmarshal(data[resPtr+4:resPtr+4+resDataLen], &responseMsg)
+	fmt.Printf("greet me result: %s\n", responseMsg.Response)
 
-	return nil
-}
-
-func add(instance *wasmer.Instance) error {
-	doAdd, err := instance.Exports.GetFunction("add")
+	free, err := instance.Exports.GetFunction("p8e_free")
 	if err != nil {
 		return err
 	}
 
-	result, err := doAdd(1, 2)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("add result: %+v\n", result)
+	// free up wasm memory from allocation after call
+	free(proposed.data, proposed.len)
+	free(existing.data, existing.len)
+	free(existingOptional.data, existingOptional.len)
+	free(resPtr, resDataLen+4)
+
+	// re-fetch to inspect un-allocated data
+	data = memory.Data()
+	fmt.Printf("Unallocated proposed data section: %v\n", data[proposed.data.(int32):proposed.data.(int32)+proposed.len])
+	fmt.Printf("Unallocated existing data section: %v\n", data[existing.data.(int32):existing.data.(int32)+existing.len])
+	fmt.Printf("Unallocated existingOptional data section: %v\n", data[existingOptional.data.(int32):existingOptional.data.(int32)+existingOptional.len])
+	fmt.Printf("Unallocated result data section: %v\n", data[resPtr:resPtr+4+resDataLen])
 
 	return nil
 }

@@ -9,4 +9,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
-libc = "0.2"
+protobuf = "3.0.3"
+protobuf-json-mapping = "3.0.3"
+p8e_attributes = { path = "../p8e_attributes" }
+p8e_helpers = { path = "../p8e_helpers" }
+
+[build-dependencies]
+protobuf = "3.0.3"
+protobuf-codegen = "3.0.3"
