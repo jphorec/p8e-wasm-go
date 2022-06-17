@@ -15,6 +15,7 @@ import (
 import (
 	"encoding/binary"
 	"encoding/json"
+	"strings"
 )
 
 type RecordType string
@@ -53,8 +54,12 @@ func RunCmd() *cobra.Command {
 				return err
 			}
 			log.Println("Exports are:")
+			p8eFunctions := make([]string, len(module.Exports()))
 			for _, exp := range module.Exports() {
 				log.Printf("exported:%s", exp.Name())
+				if strings.HasPrefix(exp.Name(), "__P8E_FUNCTION_") && !strings.HasPrefix(exp.Name(), "__P8E_FUNCTION_LENGTH_") {
+					p8eFunctions = append(p8eFunctions[:], exp.Name())
+				}
 			}
 
 			importObj := wasmer.NewImportObject()
@@ -63,8 +68,8 @@ func RunCmd() *cobra.Command {
 				return err
 			}
 
-			log.Println("p8e functions are")
-			p8eTable, err := instance.Exports.GetGlobal("__P8E_FUNCTIONS")
+			log.Printf("p8e functions are %+v", p8eFunctions)
+			p8eTable, err := instance.Exports.GetGlobal("__P8E_FUNCTION_greet_me")
 			if err != nil {
 				return err
 			}
@@ -76,20 +81,20 @@ func RunCmd() *cobra.Command {
 			data := memory.Data()
 			tbl := value.(int32)
 			ptr := binary.LittleEndian.Uint32(data[tbl : tbl+4])
-			p8eTableLenG, err := instance.Exports.GetGlobal("__P8E_FUNCTIONS_LENGTH")
-			value, _ = p8eTableLenG.Get()
-			p8eTableLen := value.(int32)
-			p8eTableLenValue := binary.LittleEndian.Uint32(data[p8eTableLen : p8eTableLen+4])
-			p8eTableValue := string(data[ptr : ptr+p8eTableLenValue])
-			log.Printf("p8e function table len: %d\n", p8eTableLenValue)
-			log.Printf("p8e function table: %s\n", p8eTableValue)
-			var functionTable []P8eFunction
-			err = json.Unmarshal([]byte(p8eTableValue), &functionTable)
+			p8eFunctionDetailsLenG, err := instance.Exports.GetGlobal("__P8E_FUNCTION_LENGTH_greet_me")
+			value, _ = p8eFunctionDetailsLenG.Get()
+			p8eFunctionDetailsLen := value.(int32)
+			p8eFunctionDetailsLenValue := binary.LittleEndian.Uint32(data[p8eFunctionDetailsLen : p8eFunctionDetailsLen+4])
+			p8eFunctionDetailsValue := string(data[ptr : ptr+p8eFunctionDetailsLenValue])
+			log.Printf("p8e function table len: %d\n", p8eFunctionDetailsLenValue)
+			log.Printf("p8e function table: %s\n", p8eFunctionDetailsValue)
+			var functionDetails P8eFunction
+			err = json.Unmarshal([]byte(p8eFunctionDetailsValue), &functionDetails)
 			if err != nil {
 				return err
 			}
-			indented, err := json.MarshalIndent(functionTable, "", " ")
-			log.Printf("function table: %s", indented)
+			indented, err := json.MarshalIndent(functionDetails, "", " ")
+			log.Printf("function details: %s", indented)
 
 			err = greetMe(instance, "your majesty")
 			if err != nil {

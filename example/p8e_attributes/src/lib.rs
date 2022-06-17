@@ -1,25 +1,23 @@
 use core::panic;
-use std::sync::Mutex;
-
 use darling::{FromMeta, ToTokens};
-use proc_macro::{Span, TokenStream};
+use p8e_helpers::Participants;
+use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use serde::Serialize;
+use std::{error::Error, str::FromStr};
 use syn::{
-    parse::Parser, parse_macro_input, punctuated::Punctuated, token::Comma, Attribute,
-    AttributeArgs, Ident, ItemFn, NestedMeta, PatType, Path, Signature,
+    parse::{Parse, ParseStream, Parser},
+    parse_macro_input,
+    punctuated::Punctuated,
+    token::Comma,
+    Attribute, AttributeArgs, Ident, ItemFn, Lit, LitStr, Meta, NestedMeta, PatType, Path,
+    PathSegment, Signature, Token,
 };
-
-#[macro_use]
-extern crate lazy_static;
-
-lazy_static! {
-    static ref DEPS: Mutex<Option<Vec<P8eFunctionDetails>>> = Mutex::new(Some(Default::default()));
-}
 
 #[derive(Debug, Serialize, Clone)]
 struct P8eFunctionDetails {
     name: String,
+    invoked_by: Participants,
     parameters: Vec<P8eInputOrRecord>,
 }
 
@@ -87,49 +85,10 @@ impl P8eInputOrRecord {
         }
     }
 }
-
-// #[derive(Debug, FromMeta)]
-// struct P8eParticipantsArgs {
-//     #[darling(multiple, rename = "role")]
-//     roles: Vec<String>, // todo: vec of party type enum? Is that a thing in macros?
-// }
-// // todo: participants annotation (one per project??? Are we limiting contracts to be own wasm files?)
-// #[proc_macro_attribute]
-// pub fn participants(attr: TokenStream, item: TokenStream) -> TokenStream {
-//     item
-// }
-
-// #[derive(Debug, FromMeta)]
-// struct P8eScopeSpecificationArgs {
-//     name: String,
-// }
-// // todo: scope specification annotation (again, one per project??? signifies which scope specs a contract operates against)
-// // actually... lets just let each of these accept one scope spec maybe
-// #[proc_macro_attribute]
-// pub fn scope_specification(attr: TokenStream, item: TokenStream) -> TokenStream {
-//     item
-// }
-
-// #[derive(Debug, FromMeta)]
-// struct P8eScopeSpecificationDefinitionArgs {
-//     uuid: String,
-//     name: String,
-//     description: String,
-//     website_url: String,
-//     icon_url: String,
-//     #[darling(multiple, rename = "party")]
-//     parties: Vec<String>, // todo: make this an enum???
-// }
-// // todo: scope specification definition annotation, multiple per project regardless
-// #[proc_macro_attribute]
-// pub fn scope_specification_definition(attr: TokenStream, item: TokenStream) -> TokenStream {
-//     item
-// }
-
 #[derive(Debug, FromMeta)]
 struct P8eFunctionArgs {
     name: String,
-    invoked_by: String, // todo: make this an enum???
+    invoked_by: Participants,
 }
 
 fn attribute_name(attr: &&Attribute) -> String {
@@ -228,8 +187,6 @@ fn consume_param_attribute(fun: ItemFn) -> (ItemFn, Vec<P8eInputOrRecord>) {
         ..fun.sig
     };
 
-    println!("stuff: {:#?}", record_details);
-
     (ItemFn { sig, ..fun }, record_details)
 }
 
@@ -282,7 +239,7 @@ fn wrapper_function(
  * - invoked_by: the party type that is responsible for supplying any proposed records in order for this function to execute
  */
 #[proc_macro_attribute]
-pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn p8e_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr_args = parse_macro_input!(attr as AttributeArgs);
     let item_clone = item.clone();
     let item_args = parse_macro_input!(item_clone as ItemFn);
@@ -299,53 +256,208 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return TokenStream::from(e.write_errors()),
     };
 
-    if let Some(map) = DEPS.lock().unwrap().as_mut() {
-        map.push(P8eFunctionDetails {
-            name: function_name,
-            parameters: param_attributes.clone(),
-        });
-    } else {
-        panic!("Adding functions after `p8e_record!` invocation");
-    }
+    // if let Some(map) = DEPS.lock().unwrap().as_mut() {
+    //     map.push(P8eFunctionDetails {
+    //         name: function_name,
+    //         parameters: param_attributes.clone(),
+    //     });
+    // } else {
+    //     panic!("Adding functions after `p8e_record!` invocation");
+    // }
+    let functions_string = serde_json::to_string(&P8eFunctionDetails {
+        name: function_name.clone(),
+        invoked_by: args.invoked_by,
+        parameters: param_attributes.clone(),
+    })
+    .unwrap();
+    let functions_length: i32 = functions_string.len().try_into().unwrap();
+
+    let function_json_ident = format_ident!("__P8E_FUNCTION_{}", function_name);
+    let function_json_length_ident = format_ident!("__P8E_FUNCTION_LENGTH_{}", function_name);
 
     let wrapper = wrapper_function(attribute_stripped_function, param_attributes);
 
-    println!("found record marked {:?}", args.name);
     quote!(
         #function_stream
         #wrapper
+        #[no_mangle]
+        pub static #function_json_ident: &'static str = #functions_string;
+        #[no_mangle]
+        pub static #function_json_length_ident: i32 = #functions_length;
     )
     .into()
 }
 
+#[derive(Debug, Serialize)]
+struct P8eContractDetails {
+    scope_specifications: Vec<String>,
+    participants: Vec<Participants>,
+}
+
+impl Parse for P8eContractDetails {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        // Parse the argument name
+
+        let mut scope_specifications: Vec<String> = vec![];
+        let mut participants: Vec<Participants> = vec![];
+
+        while !input.is_empty() {
+            let arg_name: Ident = input.parse()?;
+
+            // Parse (and discard the span of) the `=` token
+            let _: Token![=] = input.parse()?;
+
+            // todo: revisit this if darling crate ever implements nice parsing of enum values on rhs of attribute
+            // todo: allow for string versions of participants as well? ... maybe just go back to pure darling way of having
+            // individual 'partcipant'/'scope_specification' values that get merged into one... though that wouldn't allow for the
+            // enum-like syntax... but I could just do some validation on the produced values that they are legit
+            let lookahead = input.lookahead1();
+            match arg_name.to_string().as_str() {
+                "scope_specifications" => {
+                    let group = input.parse::<proc_macro2::Group>()?;
+                    let parser = Punctuated::<NestedMeta, Comma>::parse_terminated;
+                    let scope_spec_list = match parser.parse(group.stream().into()) {
+                        Ok(args) => args,
+                        Err(e) => panic!("Error parsing attribute args {}", e),
+                    }.iter().map(|str| -> Result<String, syn::Error> {
+                        if let NestedMeta::Lit(Lit::Str(s)) = str {
+                            Ok(s.value())
+                        } else {
+                            Err(syn::Error::new_spanned(str, "unsupported scope specification syntax"))
+                        }
+                    }).collect::<Result<Vec<String>, syn::Error>>().unwrap();
+                    scope_specifications.extend(scope_spec_list)
+                },
+                "participants" => {
+                    let group = input.parse::<proc_macro2::Group>()?;
+                    let parser = Punctuated::<NestedMeta, Comma>::parse_terminated;
+                    let participants_list: Vec<Participants> = match parser.parse(group.stream().into()) {
+                        Ok(args) => args,
+                        Err(e) => panic!("Error parsing attribute args {}", e),
+                    }.iter().map(|path| -> Result<Participants, syn::Error> {
+                        match path {
+                            NestedMeta::Meta(Meta::Path(Path {  segments, .. })) => {
+                                if let PathSegment { ident, ..} = segments.last().unwrap() {
+                                    ident.to_string().try_into().map_err(|_| syn::Error::new_spanned(path, "unsupported participant {}"))
+                                } else {
+                                    Err(syn::Error::new_spanned(path, "unsupported participant"))
+                                }
+                            },
+                            _ => Err(syn::Error::new_spanned(path, "unsupported participant syntax"))
+                        }
+                    }).collect::<Result<Vec<Participants>, syn::Error>>().unwrap();
+                    participants.extend(participants_list)
+                },
+                "scope_specification" => {
+                    if lookahead.peek(LitStr) {
+                        let scope_spec = input.parse::<LitStr>()?;
+                        scope_specifications.push(scope_spec.value());
+                    }
+                },
+                "participant" => {
+                    let path = input.call(Path::parse_mod_style)?;
+                    match path.segments.last().unwrap() {
+                        PathSegment { ident, ..} => {
+                            participants.push(ident.to_string().try_into().map_err(|_| syn::Error::new_spanned(path, "unsupported participant {}"))?);
+                        }
+                        _ => return Err(syn::Error::new_spanned(arg_name, "unsupported participant"))
+                    }
+                },
+                _ => return Err(syn::Error::new_spanned(
+                    arg_name,
+                    "unsupported p8e_contract attribute, expected `participant` or `scope_specification`",
+                ))
+            }
+
+            if input.lookahead1().peek(Token![,]) {
+                let _: Token![,] = input.parse()?;
+            }
+        }
+
+        Ok(Self {
+            scope_specifications,
+            participants,
+        })
+    }
+}
+
 /**
- * This ties all the p8e_record annotated function details together for export
- *
- * todo: can we do without this somehow? Either by some automagic injection of the gathered
- * function specifications, or by having each function just export its own static details
- * prefixed with __P8E_FUNCTION_...?
- *
- * todo: more than just a list of function names, need actual structure
- * todo: determine if this will just end up as a json stringified version of a vector of some nice struct
+ * This defines the top-level contract metadata needed for contract execution
  */
 #[proc_macro]
-pub fn contract(_input: TokenStream) -> TokenStream {
-    let map = DEPS.lock().unwrap().take();
+pub fn p8e_contract(input: TokenStream) -> TokenStream {
+    let contract_details = parse_macro_input!(input as P8eContractDetails);
 
-    if let Some(map) = map {
-        // let elems = map.iter().map(|fun| serde_json::to_string(fun).unwrap());
-        let functions_string = serde_json::to_string(&map).unwrap();
-        let functions_length: i32 = functions_string.len().try_into().unwrap();
-        println!("functions_length {}", functions_length);
+    let contract_string = serde_json::to_string(&contract_details).unwrap();
+    let contract_length: i32 = contract_string.len().try_into().unwrap();
 
-        quote!(
-            #[no_mangle]
-            pub static __P8E_FUNCTIONS: &'static str = #functions_string;
-            #[no_mangle]
-            pub static __P8E_FUNCTIONS_LENGTH: i32 = #functions_length;
-        )
-        .into()
-    } else {
-        panic!("`p8e_contract!` invoked twice");
+    quote!(
+        #[no_mangle]
+        pub static __P8E_CONTRACT: &'static str = #contract_string;
+        #[no_mangle]
+        pub static __P8E_CONTRACT_LENGTH: i32 = #contract_length;
+    )
+    .into()
+}
+
+#[derive(Debug, FromMeta, Serialize)]
+struct P8eScopeSpecification {
+    uuid: P8eUuid,
+    name: String,
+    description: String,
+    #[darling(multiple, rename = "party")]
+    parties_involved: Vec<Participants>,
+    website_url: Option<String>,
+    icon_url: Option<String>,
+}
+
+#[derive(Debug)]
+struct P8eUuid {
+    value: String,
+}
+
+impl FromMeta for P8eUuid {
+    fn from_string(value: &str) -> darling::Result<Self> {
+        uuid::Uuid::from_str(value)
+            .map(|uuid| P8eUuid {
+                value: uuid.to_string(),
+            })
+            .map_err(|e| darling::Error::custom(e.to_string()))
     }
+}
+
+impl Serialize for P8eUuid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.value.as_str())
+    }
+}
+
+/**
+ * This ties all the p8e_record annotated function details together for export
+ */
+#[proc_macro]
+pub fn p8e_scope_specification(input: TokenStream) -> TokenStream {
+    let attr_args = parse_macro_input!(input as AttributeArgs);
+    let scope_spec_details = match P8eScopeSpecification::from_list(&attr_args) {
+        Ok(v) => v,
+        Err(e) => return TokenStream::from(e.write_errors()),
+    };
+
+    let scope_spec_string = serde_json::to_string(&scope_spec_details).unwrap();
+    let scope_spec_length: i32 = scope_spec_string.len().try_into().unwrap();
+
+    let ident_uuid = scope_spec_details.uuid.value.replace("-", "_");
+    let scope_spec_json_ident = format_ident!("__P8E_SCOPE_SPEC_{}", ident_uuid);
+    let scope_spec_json_length_ident = format_ident!("__P8E_SCOPE_SPEC_LENGTH_{}", ident_uuid);
+
+    quote!(
+        #[no_mangle]
+        pub static #scope_spec_json_ident: &'static str = #scope_spec_string;
+        #[no_mangle]
+        pub static #scope_spec_json_length_ident: i32 = #scope_spec_length;
+    )
+    .into()
 }
