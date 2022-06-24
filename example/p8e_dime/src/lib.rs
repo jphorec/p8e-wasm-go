@@ -22,6 +22,10 @@ use protobuf::{Message, MessageField};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::Sha256;
 
+lazy_static! {
+    static ref RANDOM: SystemRandom = SystemRandom::new();
+}
+
 #[no_mangle]
 pub extern "C" fn create_dime(request_bytes: *const u8, request_bytes_len: usize) -> *const u8 {
     entrypoint(request_bytes, request_bytes_len, create_dime_inner)
@@ -32,6 +36,9 @@ pub extern "C" fn decrypt_dime(request_bytes: *const u8, request_bytes_len: usiz
     entrypoint(request_bytes, request_bytes_len, decrypt_dime_inner)
 }
 
+/**
+ * Helper function to create generic wasm entrypoints with a single proto request/response pattern
+ */
 fn entrypoint<T, R, H>(request_bytes: *const u8, request_bytes_len: usize, handler: H) -> *const u8
 where
     T: Message,
@@ -91,41 +98,42 @@ fn create_dime_inner(request: EncryptRequest) -> Result<EncryptResponse, DIMEErr
     Ok(response)
 }
 
-/**
- * Create Audience proto for a given audience public key and encryption key (DEK)
- *
- * This proto contains an encrypted version of the symmetric encryption key used to encrypt a DIME payload, that can be
- * decrypted by the corresponding audience member's private key and subsequently used to decrypt the DIME encrypted payload.
- */
-fn get_audience(audience_public_key: &[u8], key: &[u8]) -> Result<Audience, DIMEError> {
-    let ephemeral_secret = EphemeralSecret::random(&mut OsRng);
+fn decrypt_dime_inner(request: DecryptRequest) -> Result<DecryptResponse, DIMEError> {
+    let dime = request.dime;
+    let private_key_bytes = request.private_key;
+    let private_key = SecretKey::from_be_bytes(&private_key_bytes)
+        .map_err(|_| DIMEError::PrivateKeyDecodingError)?;
+    let public_key = private_key.public_key();
+    let public_key_bytes = public_key.to_encoded_point(false).as_bytes().to_vec();
+    let audience_member = find_audience(&dime, &public_key_bytes);
 
-    let secret = ephemeral_secret.diffie_hellman(
-        &PublicKey::from_sec1_bytes(audience_public_key)
-            .map_err(|_| DIMEError::PublicKeyDecodingError)?,
+    let secret = diffie_hellman(
+        private_key.to_nonzero_scalar(),
+        PublicKey::from_sec1_bytes(&audience_member.ephemeral_pubkey)
+            .unwrap()
+            .as_affine(),
     );
 
-    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes().as_slice(), &[])?;
+    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes(), &[])?;
 
     let (enc_key, mac_key) = derived_key.split_at(32);
 
-    let tag = encrypt(mac_key, enc_key, true)?;
-    let encrypted_key = encrypt(key, enc_key, false)?;
+    let mac = encrypt(mac_key, enc_key, true)?;
+    assert_eq!(
+        audience_member.tag,
+        mac,
+        "Invalid MAC (expected length: {}, actual length: {})",
+        audience_member.tag.len(),
+        mac.len()
+    );
 
-    let mut audience = Audience::new();
+    let dek = decrypt(&audience_member.encrypted_dek, enc_key, false)?;
+    let plaintext = decrypt(&dime.payload.first().unwrap().cipher_text, &dek, false)?;
 
-    audience.context = ContextType::RETRIEVAL.into(); // todo: support other context types? Is this still needed in DIME world?
-    audience.public_key = audience_public_key.to_vec();
-    audience.encrypted_dek = encrypted_key;
-    audience.ephemeral_pubkey = ephemeral_secret
-        .public_key()
-        .to_encoded_point(false)
-        .as_bytes()
-        .to_vec();
-    audience.tag = tag;
-    audience.payload_id = 0; // todo: are multi-payload actually used/going to be used?
+    let mut response = DecryptResponse::new();
+    response.payload = plaintext;
 
-    Ok(audience)
+    Ok(response)
 }
 
 const NONCE_LENGTH: usize = 12;
@@ -178,7 +186,6 @@ fn decrypt(ciphertext: &[u8], encryption_key: &[u8], zero_iv: bool) -> Result<Ve
             &ciphertext[4..nonce_length + 4],
             &ciphertext[nonce_length + 4..],
         )
-        // RANDOM.fill(&mut nonce_buffer).unwrap(); // todo: fetch off payload
     } else {
         (&[0u8; NONCE_LENGTH], &ciphertext[NONCE_LENGTH..])
     };
@@ -193,43 +200,43 @@ fn decrypt(ciphertext: &[u8], encryption_key: &[u8], zero_iv: bool) -> Result<Ve
     Ok(plaintext)
 }
 
-// todo: decrypt entrypoint
-fn decrypt_dime_inner(request: DecryptRequest) -> Result<DecryptResponse, DIMEError> {
-    let dime = request.dime;
-    let private_key_bytes = request.private_key;
-    let private_key = SecretKey::from_be_bytes(&private_key_bytes)
-        .map_err(|_| DIMEError::PrivateKeyDecodingError)?;
-    let public_key = private_key.public_key();
-    let public_key_bytes = public_key.to_encoded_point(false).as_bytes().to_vec();
-    let audience_member = find_audience(&dime, &public_key_bytes);
+/** Audience creation/retrieval */
 
-    let secret = diffie_hellman(
-        private_key.to_nonzero_scalar(),
-        PublicKey::from_sec1_bytes(&audience_member.ephemeral_pubkey)
-            .unwrap()
-            .as_affine(),
+/**
+ * Create Audience proto for a given audience public key and encryption key (DEK)
+ *
+ * This proto contains an encrypted version of the symmetric encryption key used to encrypt a DIME payload, that can be
+ * decrypted by the corresponding audience member's private key and subsequently used to decrypt the DIME encrypted payload.
+ */
+fn get_audience(audience_public_key: &[u8], key: &[u8]) -> Result<Audience, DIMEError> {
+    let ephemeral_secret = EphemeralSecret::random(&mut OsRng);
+
+    let secret = ephemeral_secret.diffie_hellman(
+        &PublicKey::from_sec1_bytes(audience_public_key)
+            .map_err(|_| DIMEError::PublicKeyDecodingError)?,
     );
 
-    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes(), &[])?;
+    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes().as_slice(), &[])?;
 
     let (enc_key, mac_key) = derived_key.split_at(32);
 
-    let mac = encrypt(mac_key, enc_key, true)?;
-    assert_eq!(
-        audience_member.tag,
-        mac,
-        "Invalid MAC (expected length: {}, actual length: {})",
-        audience_member.tag.len(),
-        mac.len()
-    );
+    let tag = encrypt(mac_key, enc_key, true)?;
+    let encrypted_key = encrypt(key, enc_key, false)?;
 
-    let dek = decrypt(&audience_member.encrypted_dek, enc_key, false)?;
-    let plaintext = decrypt(&dime.payload.first().unwrap().cipher_text, &dek, false)?;
+    let mut audience = Audience::new();
 
-    let mut response = DecryptResponse::new();
-    response.payload = plaintext;
+    audience.context = ContextType::RETRIEVAL.into(); // todo: support other context types? Is this still needed in DIME world?
+    audience.public_key = audience_public_key.to_vec();
+    audience.encrypted_dek = encrypted_key;
+    audience.ephemeral_pubkey = ephemeral_secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    audience.tag = tag;
+    audience.payload_id = 0; // todo: are multi-payload actually used/going to be used?
 
-    Ok(response)
+    Ok(audience)
 }
 
 fn find_audience(dime: &DIME, public_key_bytes: &[u8]) -> Audience {
@@ -240,11 +247,6 @@ fn find_audience(dime: &DIME, public_key_bytes: &[u8]) -> Audience {
         .to_owned()
 }
 
-lazy_static! {
-    static ref RANDOM: SystemRandom = SystemRandom::new();
-}
-
-// todo: is this the correct key length?
 const ENCRYPTION_KEY_LENGTH: usize = 32;
 
 fn generate_encryption_key() -> [u8; ENCRYPTION_KEY_LENGTH] {
@@ -273,8 +275,6 @@ fn hkdf_derive(
     Ok(output_key_material.into())
 }
 
-// todo: round-trip test of plaintext -> ciphertext -> plaintext
-// todo: derive repeatability test
 // todo: failure to decrypt with non-audience private key test
 #[cfg(test)]
 mod tests {
