@@ -18,7 +18,7 @@ lazy_static = "1.4.0"
 protobuf = "3.0.3"
 p8e_helpers = { path = "../p8e_helpers" }
 k256 = { version = "0.11.2", features = ["ecdh"] }
-base64 = "0.13.0"
+thiserror = "1.0.31"
 
 [build-dependencies]
 protobuf = "3.0.3"

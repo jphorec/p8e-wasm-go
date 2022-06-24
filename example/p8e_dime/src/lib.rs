@@ -1,16 +1,18 @@
-use std::{borrow::Borrow, str::from_utf8};
+use std::{borrow::Borrow, error::Error, panic::catch_unwind, str::from_utf8};
 
 use aes_gcm::{
     aead::{Aead, NewAead},
     Aes256Gcm, Key, Nonce,
 };
 use ecdsa::elliptic_curve::{group::GroupEncoding, rand_core::OsRng, sec1::ToEncodedPoint};
+use errors::DIMEError;
 use hkdf::Hkdf;
 use k256::{
     ecdh::{self, diffie_hellman, EphemeralSecret},
     PublicKey, Secp256k1, SecretKey,
 };
 use lazy_static::lazy_static;
+mod errors;
 mod proto;
 use proto::{
     encryption::{Audience, ContextType, Payload, DIME},
@@ -26,7 +28,7 @@ pub extern "C" fn create_dime(request_bytes: *const u8, request_bytes_len: usize
 
     let request = EncryptRequest::parse_from_bytes(request_buffer).unwrap();
 
-    let response = create_dime_inner(request);
+    let response = create_dime_inner(request).unwrap(); // todo: better wasm-level error handling?
     let response_bytes = response.write_to_bytes().unwrap();
 
     let buf_len: i32 = response_bytes.len().try_into().unwrap();
@@ -41,18 +43,18 @@ pub extern "C" fn create_dime(request_bytes: *const u8, request_bytes_len: usize
     dst_ptr
 }
 
-fn create_dime_inner(request: EncryptRequest) -> DIME {
+fn create_dime_inner(request: EncryptRequest) -> Result<DIME, DIMEError> {
     let key = generate_encryption_key();
-    let cipher_text = encrypt(&request.payload, &key, false);
+    let cipher_text = encrypt(&request.payload, &key, false)?;
 
-    let owner = get_audience(&request.owner_public_key, &key);
+    let owner = get_audience(&request.owner_public_key, &key)?;
 
     // for each audience member, calculate derived secret to generate MAC and ENC key, encrypt DEK
     let mut audience_list = request
         .audience_public_key
         .iter()
         .map(|public_key| get_audience(public_key, &key))
-        .collect::<Vec<Audience>>(); // add owner to audience list
+        .collect::<Result<Vec<Audience>, _>>()?; // add owner to audience list
 
     audience_list.append(&mut vec![owner.clone()]);
 
@@ -69,7 +71,7 @@ fn create_dime_inner(request: EncryptRequest) -> DIME {
     dime.audience = audience_list;
     dime.metadata = request.metadata;
 
-    dime
+    Ok(dime)
 }
 
 /**
@@ -78,18 +80,20 @@ fn create_dime_inner(request: EncryptRequest) -> DIME {
  * This proto contains an encrypted version of the symmetric encryption key used to encrypt a DIME payload, that can be
  * decrypted by the corresponding audience member's private key and subsequently used to decrypt the DIME encrypted payload.
  */
-fn get_audience(audience_public_key: &[u8], key: &[u8]) -> Audience {
+fn get_audience(audience_public_key: &[u8], key: &[u8]) -> Result<Audience, DIMEError> {
     let ephemeral_secret = EphemeralSecret::random(&mut OsRng);
 
-    let secret =
-        ephemeral_secret.diffie_hellman(&PublicKey::from_sec1_bytes(audience_public_key).unwrap());
+    let secret = ephemeral_secret.diffie_hellman(
+        &PublicKey::from_sec1_bytes(audience_public_key)
+            .map_err(|_| DIMEError::PublicKeyDecodingError)?,
+    );
 
-    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes().as_slice(), &[]);
+    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes().as_slice(), &[])?;
 
     let (enc_key, mac_key) = derived_key.split_at(32);
 
-    let tag = encrypt(mac_key, enc_key, true);
-    let encrypted_key = encrypt(key, enc_key, false);
+    let tag = encrypt(mac_key, enc_key, true)?;
+    let encrypted_key = encrypt(key, enc_key, false)?;
 
     let mut audience = Audience::new();
 
@@ -104,44 +108,55 @@ fn get_audience(audience_public_key: &[u8], key: &[u8]) -> Audience {
     audience.tag = tag;
     audience.payload_id = 0; // todo: are multi-payload actually used/going to be used?
 
-    audience
+    Ok(audience)
 }
 
 const NONCE_LENGTH: usize = 12;
-fn encrypt(payload: &[u8], encryption_key: &[u8], zero_iv: bool) -> Vec<u8> {
+fn encrypt(payload: &[u8], encryption_key: &[u8], zero_iv: bool) -> Result<Vec<u8>, DIMEError> {
     // encrypt payload with DEK
     let key = Key::from_slice(encryption_key);
     let cipher = Aes256Gcm::new(key);
     let mut nonce_buffer = [0u8; NONCE_LENGTH];
     if !zero_iv {
-        RANDOM.fill(&mut nonce_buffer).unwrap();
+        RANDOM
+            .fill(&mut nonce_buffer)
+            .map_err(|_| DIMEError::Unspecified)?;
     }
     let nonce = Nonce::from_slice(&nonce_buffer);
-    let ciphertext = cipher.encrypt(nonce, payload).expect("encryption error");
+    let ciphertext = cipher
+        .encrypt(nonce, payload)
+        .map_err(|e| DIMEError::EncryptionError)?;
 
     // return encrypted data
     if !zero_iv {
         // place size and nonce in buffer before ciphertext
-        let mut buffer = u32::to_le_bytes(NONCE_LENGTH.try_into().unwrap()).to_vec();
+        let mut buffer = u32::to_le_bytes(
+            NONCE_LENGTH
+                .try_into()
+                .map_err(|_| DIMEError::Unspecified)?,
+        )
+        .to_vec();
         buffer.extend(nonce_buffer);
         buffer.extend(ciphertext);
-        buffer
+        Ok(buffer)
     } else {
         // place NONCE_LENGTH zero buffer before ciphertext
         let mut buffer = nonce_buffer.to_vec();
         buffer.extend(ciphertext);
-        buffer
+        Ok(buffer)
     }
 }
 
-fn decrypt(ciphertext: &[u8], encryption_key: &[u8], zero_iv: bool) -> Vec<u8> {
+fn decrypt(ciphertext: &[u8], encryption_key: &[u8], zero_iv: bool) -> Result<Vec<u8>, DIMEError> {
     // decrypt payload with DEK
     let key = Key::from_slice(encryption_key);
     let cipher = Aes256Gcm::new(key);
     let (nonce_buffer, ciphertext): (&[u8], &[u8]) = if !zero_iv {
         let mut nonce_length = [0u8; 4];
         nonce_length.copy_from_slice(&ciphertext[0..4]);
-        let nonce_length: usize = u32::from_le_bytes(nonce_length).try_into().unwrap();
+        let nonce_length: usize = u32::from_le_bytes(nonce_length)
+            .try_into()
+            .map_err(|_| DIMEError::DecryptionError)?;
         (
             &ciphertext[4..nonce_length + 4],
             &ciphertext[nonce_length + 4..],
@@ -150,15 +165,19 @@ fn decrypt(ciphertext: &[u8], encryption_key: &[u8], zero_iv: bool) -> Vec<u8> {
     } else {
         (&[0u8; NONCE_LENGTH], &ciphertext[NONCE_LENGTH..])
     };
-    let nonce = Nonce::from_slice(&nonce_buffer);
-    let plaintext = cipher.decrypt(nonce, ciphertext).unwrap();
+    // Nonce::from_slice panics if the slice isn't valid, catch_unwind allows converting this to a Result
+    let nonce = catch_unwind(|| Nonce::from_slice(&nonce_buffer))
+        .map_err(|_| DIMEError::DecryptionError)?;
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| DIMEError::DecryptionError)?;
 
     // return decrypted data
-    plaintext
+    Ok(plaintext)
 }
 
 // todo: decrypt entrypoint
-fn decrypt_dime(dime: DIME, private_key_bytes: &[u8]) -> Vec<u8> {
+fn decrypt_dime(dime: DIME, private_key_bytes: &[u8]) -> Result<Vec<u8>, DIMEError> {
     let private_key = SecretKey::from_be_bytes(&private_key_bytes).unwrap();
     let public_key = private_key.public_key();
     let public_key_bytes = public_key.to_encoded_point(false).as_bytes().to_vec();
@@ -171,11 +190,11 @@ fn decrypt_dime(dime: DIME, private_key_bytes: &[u8]) -> Vec<u8> {
             .as_affine(),
     );
 
-    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes(), &[]);
+    let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes(), &[])?;
 
     let (enc_key, mac_key) = derived_key.split_at(32);
 
-    let mac = encrypt(mac_key, enc_key, true);
+    let mac = encrypt(mac_key, enc_key, true)?;
     assert_eq!(
         audience_member.tag,
         mac,
@@ -184,10 +203,10 @@ fn decrypt_dime(dime: DIME, private_key_bytes: &[u8]) -> Vec<u8> {
         mac.len()
     );
 
-    let dek = decrypt(&audience_member.encrypted_dek, enc_key, false);
-    let plaintext = decrypt(&dime.payload.first().unwrap().cipher_text, &dek, false);
+    let dek = decrypt(&audience_member.encrypted_dek, enc_key, false)?;
+    let plaintext = decrypt(&dime.payload.first().unwrap().cipher_text, &dek, false)?;
 
-    plaintext
+    Ok(plaintext)
 }
 
 fn find_audience(dime: &DIME, public_key_bytes: &[u8]) -> Audience {
@@ -220,15 +239,15 @@ fn hkdf_derive(
     salt: Option<&[u8]>,
     input_key_material: &[u8],
     info: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, DIMEError> {
     let pseudorandom_key = Hkdf::<Sha256>::new(salt, input_key_material);
     let mut output_key_material = vec![0u8; size];
 
     pseudorandom_key
         .expand(info, &mut output_key_material)
-        .unwrap();
+        .map_err(|_| DIMEError::HkdfError)?;
 
-    output_key_material.into()
+    Ok(output_key_material.into())
 }
 
 // todo: round-trip test of plaintext -> ciphertext -> plaintext
@@ -237,7 +256,7 @@ fn hkdf_derive(
 #[cfg(test)]
 mod tests {
     use core::panic;
-    use std::{ascii::AsciiExt, borrow::Borrow};
+    use std::panic::catch_unwind;
 
     use aes_gcm::{
         aead::generic_array::{ArrayLength, GenericArray},
@@ -273,7 +292,7 @@ mod tests {
         uuid.value = Uuid::new_v4().to_string();
         request.uuid = MessageField::some(uuid);
 
-        let dime = create_dime_inner(request.clone());
+        let dime = create_dime_inner(request.clone()).unwrap();
 
         if let Some(owner) = dime.owner.0 {
             assert_eq!(
@@ -307,9 +326,9 @@ mod tests {
         uuid.value = Uuid::new_v4().to_string();
         request.uuid = MessageField::some(uuid);
 
-        let dime = create_dime_inner(request);
+        let dime = create_dime_inner(request).unwrap();
 
-        let decrypted_plaintext = decrypt_dime(dime, &owner_private_key_bytes);
+        let decrypted_plaintext = decrypt_dime(dime, &owner_private_key_bytes).unwrap();
 
         assert_eq!(
             plaintext,
@@ -326,8 +345,8 @@ mod tests {
             base64::decode("3aTCPoNkrszooOadNgFv1JnweFrgjNmAlWKIdBemssA=")
                 .expect("Failed to parse owner private key bytes");
 
-        let result1 = hkdf_derive(64, None, &owner_private_key_bytes, &[]);
-        let result2 = hkdf_derive(64, None, &owner_private_key_bytes, &[]);
+        let result1 = hkdf_derive(64, None, &owner_private_key_bytes, &[]).unwrap();
+        let result2 = hkdf_derive(64, None, &owner_private_key_bytes, &[]).unwrap();
 
         assert_eq!(
             result1, result2,
@@ -342,8 +361,8 @@ mod tests {
         Aes256Gcm::new(key);
 
         let plaintext = b"hello there";
-        let ciphertext = encrypt(plaintext, key, false);
-        let decrypted = decrypt(&ciphertext, key, false);
+        let ciphertext = encrypt(plaintext, key, false).unwrap();
+        let decrypted = decrypt(&ciphertext, key, false).unwrap();
 
         assert_eq!(plaintext, decrypted.as_slice());
     }
@@ -355,9 +374,21 @@ mod tests {
         Aes256Gcm::new(key);
 
         let plaintext = b"hello there";
-        let ciphertext = encrypt(plaintext, key, true);
-        let decrypted = decrypt(&ciphertext, key, true);
+        let ciphertext = encrypt(plaintext, key, true).unwrap();
+        let decrypted = decrypt(&ciphertext, key, true).unwrap();
 
         assert_eq!(plaintext, decrypted.as_slice());
+    }
+
+    #[test]
+    fn aes_encrypt_decrypt_round_trip_mixed_iv_fails() {
+        let super_secret_key = b"an example very very secret key.";
+        let key = Key::from_slice(super_secret_key);
+        Aes256Gcm::new(key);
+
+        let plaintext = b"hello there";
+        let ciphertext = encrypt(plaintext, key, true).unwrap();
+
+        decrypt(&ciphertext, key, false).unwrap_err();
     }
 }

@@ -452,6 +452,7 @@ dependencies = [
  "protobuf-codegen",
  "ring",
  "sha2",
+ "thiserror",
  "uuid",
 ]
 
