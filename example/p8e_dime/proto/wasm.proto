@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package io.provenance.scope.encryption;
+
+import "util.proto";
+
+message EncryptRequest {
+    UUID uuid = 1;
+    bytes payload = 2;
+    bytes owner_public_key = 3;
+    repeated bytes audience_public_key = 4;
+    map<string, string> metadata = 5;
+}

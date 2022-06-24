@@ -1,0 +1,29 @@
+[package]
+name = "p8e_dime"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+enable-test-utils = ["uuid/v4"]
+
+[dependencies]
+ecdsa = { version = "0.14.2", features = ["pem", "pkcs8"] }
+ring = "0.16.20"
+hkdf = "0.12.3"
+sha2 = "0.10.2"
+aes-gcm = "0.9.4"
+lazy_static = "1.4.0"
+protobuf = "3.0.3"
+p8e_helpers = { path = "../p8e_helpers" }
+k256 = { version = "0.11.2", features = ["ecdh"] }
+base64 = "0.13.0"
+
+[build-dependencies]
+protobuf = "3.0.3"
+protobuf-codegen = "3.0.3"
+
+[dev-dependencies]
+base64 = "0.13.0"
+uuid = "1.1.2"

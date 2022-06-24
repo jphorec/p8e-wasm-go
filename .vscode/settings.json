@@ -1,5 +1,7 @@
 {
     "rust-analyzer.linkedProjects": [
-        "example/hello-rust/Cargo.toml"
-    ]
+        "example/hello-rust/Cargo.toml",
+        "example/p8e_dime/Cargo.toml",
+    ],
+    // "rust-analyzer.cargo.features": ["enable-test-utils"],
 }
