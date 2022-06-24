@@ -1,4 +1,4 @@
-use std::{alloc::Layout, error::Error};
+use std::alloc::Layout;
 
 use darling::FromMeta;
 use serde::Serialize;

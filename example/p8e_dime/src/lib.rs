@@ -1,34 +1,48 @@
-use std::{borrow::Borrow, error::Error, panic::catch_unwind, str::from_utf8};
+use std::panic::catch_unwind;
 
 use aes_gcm::{
     aead::{Aead, NewAead},
     Aes256Gcm, Key, Nonce,
 };
-use ecdsa::elliptic_curve::{group::GroupEncoding, rand_core::OsRng, sec1::ToEncodedPoint};
+use ecdsa::elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint};
 use errors::DIMEError;
 use hkdf::Hkdf;
 use k256::{
-    ecdh::{self, diffie_hellman, EphemeralSecret},
-    PublicKey, Secp256k1, SecretKey,
+    ecdh::{diffie_hellman, EphemeralSecret},
+    PublicKey, SecretKey,
 };
 use lazy_static::lazy_static;
 mod errors;
 mod proto;
 use proto::{
     encryption::{Audience, ContextType, Payload, DIME},
-    wasm::EncryptRequest,
+    wasm::{DecryptRequest, DecryptResponse, EncryptRequest, EncryptResponse},
 };
 use protobuf::{Message, MessageField};
-use ring::rand::{self, SecureRandom, SystemRandom};
+use ring::rand::{SecureRandom, SystemRandom};
 use sha2::Sha256;
 
 #[no_mangle]
 pub extern "C" fn create_dime(request_bytes: *const u8, request_bytes_len: usize) -> *const u8 {
+    entrypoint(request_bytes, request_bytes_len, create_dime_inner)
+}
+
+#[no_mangle]
+pub extern "C" fn decrypt_dime(request_bytes: *const u8, request_bytes_len: usize) -> *const u8 {
+    entrypoint(request_bytes, request_bytes_len, decrypt_dime_inner)
+}
+
+fn entrypoint<T, R, H>(request_bytes: *const u8, request_bytes_len: usize, handler: H) -> *const u8
+where
+    T: Message,
+    R: Message,
+    H: Fn(T) -> Result<R, DIMEError>,
+{
     let request_buffer = unsafe { std::slice::from_raw_parts(request_bytes, request_bytes_len) };
 
-    let request = EncryptRequest::parse_from_bytes(request_buffer).unwrap();
+    let request = T::parse_from_bytes(request_buffer).unwrap();
 
-    let response = create_dime_inner(request).unwrap(); // todo: better wasm-level error handling?
+    let response = handler(request).unwrap();
     let response_bytes = response.write_to_bytes().unwrap();
 
     let buf_len: i32 = response_bytes.len().try_into().unwrap();
@@ -43,7 +57,7 @@ pub extern "C" fn create_dime(request_bytes: *const u8, request_bytes_len: usize
     dst_ptr
 }
 
-fn create_dime_inner(request: EncryptRequest) -> Result<DIME, DIMEError> {
+fn create_dime_inner(request: EncryptRequest) -> Result<EncryptResponse, DIMEError> {
     let key = generate_encryption_key();
     let cipher_text = encrypt(&request.payload, &key, false)?;
 
@@ -71,7 +85,10 @@ fn create_dime_inner(request: EncryptRequest) -> Result<DIME, DIMEError> {
     dime.audience = audience_list;
     dime.metadata = request.metadata;
 
-    Ok(dime)
+    let mut response = EncryptResponse::new();
+    response.dime = MessageField::some(dime);
+
+    Ok(response)
 }
 
 /**
@@ -125,7 +142,7 @@ fn encrypt(payload: &[u8], encryption_key: &[u8], zero_iv: bool) -> Result<Vec<u
     let nonce = Nonce::from_slice(&nonce_buffer);
     let ciphertext = cipher
         .encrypt(nonce, payload)
-        .map_err(|e| DIMEError::EncryptionError)?;
+        .map_err(|_| DIMEError::EncryptionError)?;
 
     // return encrypted data
     if !zero_iv {
@@ -177,8 +194,11 @@ fn decrypt(ciphertext: &[u8], encryption_key: &[u8], zero_iv: bool) -> Result<Ve
 }
 
 // todo: decrypt entrypoint
-fn decrypt_dime(dime: DIME, private_key_bytes: &[u8]) -> Result<Vec<u8>, DIMEError> {
-    let private_key = SecretKey::from_be_bytes(&private_key_bytes).unwrap();
+fn decrypt_dime_inner(request: DecryptRequest) -> Result<DecryptResponse, DIMEError> {
+    let dime = request.dime;
+    let private_key_bytes = request.private_key;
+    let private_key = SecretKey::from_be_bytes(&private_key_bytes)
+        .map_err(|_| DIMEError::PrivateKeyDecodingError)?;
     let public_key = private_key.public_key();
     let public_key_bytes = public_key.to_encoded_point(false).as_bytes().to_vec();
     let audience_member = find_audience(&dime, &public_key_bytes);
@@ -206,7 +226,10 @@ fn decrypt_dime(dime: DIME, private_key_bytes: &[u8]) -> Result<Vec<u8>, DIMEErr
     let dek = decrypt(&audience_member.encrypted_dek, enc_key, false)?;
     let plaintext = decrypt(&dime.payload.first().unwrap().cipher_text, &dek, false)?;
 
-    Ok(plaintext)
+    let mut response = DecryptResponse::new();
+    response.payload = plaintext;
+
+    Ok(response)
 }
 
 fn find_audience(dime: &DIME, public_key_bytes: &[u8]) -> Audience {
@@ -255,26 +278,20 @@ fn hkdf_derive(
 // todo: failure to decrypt with non-audience private key test
 #[cfg(test)]
 mod tests {
-    use core::panic;
-    use std::panic::catch_unwind;
-
-    use aes_gcm::{
-        aead::generic_array::{ArrayLength, GenericArray},
-        aead::{Aead, NewAead},
-        Aes256Gcm, Key,
-    };
-    use ecdsa::elliptic_curve::{group::GroupEncoding, sec1::ToEncodedPoint};
-    use k256::{
-        pkcs8::{der::pem::Base64Decoder, AlgorithmIdentifier, DecodePrivateKey, PrivateKeyInfo},
-        SecretKey,
-    };
+    use aes_gcm::{aead::NewAead, Aes256Gcm, Key};
+    use ecdsa::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::SecretKey;
     use protobuf::MessageField;
-    use ring::test::from_hex;
+
     use uuid::Uuid;
 
     use crate::{
-        create_dime_inner, decrypt, decrypt_dime, encrypt, hkdf_derive,
-        proto::{self, wasm::EncryptRequest},
+        create_dime_inner, decrypt, decrypt_dime_inner, encrypt, hkdf_derive,
+        proto::{
+            self,
+            encryption::DIME,
+            wasm::{DecryptRequest, EncryptRequest},
+        },
     };
 
     #[test]
@@ -292,17 +309,14 @@ mod tests {
         uuid.value = Uuid::new_v4().to_string();
         request.uuid = MessageField::some(uuid);
 
-        let dime = create_dime_inner(request.clone()).unwrap();
+        let dime = create_dime_inner(request.clone()).unwrap().dime.unwrap();
 
-        if let Some(owner) = dime.owner.0 {
-            assert_eq!(
-                &request.owner_public_key, &owner.public_key,
-                "owner public key mismatch: expected {:#?}, received {:#?}",
-                &request.owner_public_key, &owner.public_key
-            );
-        } else {
-            panic!("dime owner field is not set");
-        }
+        let owner = dime.owner.unwrap();
+        assert_eq!(
+            &request.owner_public_key, &owner.public_key,
+            "owner public key mismatch: expected {:#?}, received {:#?}",
+            &request.owner_public_key, &owner.public_key
+        );
 
         dime.audience
             .iter()
@@ -326,9 +340,13 @@ mod tests {
         uuid.value = Uuid::new_v4().to_string();
         request.uuid = MessageField::some(uuid);
 
-        let dime = create_dime_inner(request).unwrap();
+        let dime = create_dime_inner(request).unwrap().dime;
 
-        let decrypted_plaintext = decrypt_dime(dime, &owner_private_key_bytes).unwrap();
+        let mut decrypt_request = DecryptRequest::new();
+        decrypt_request.dime = dime;
+        decrypt_request.private_key = owner_private_key_bytes;
+
+        let decrypted_plaintext = decrypt_dime_inner(decrypt_request).unwrap().payload;
 
         assert_eq!(
             plaintext,
@@ -390,5 +408,14 @@ mod tests {
         let ciphertext = encrypt(plaintext, key, true).unwrap();
 
         decrypt(&ciphertext, key, false).unwrap_err();
+    }
+
+    #[test]
+    fn bogus_private_key_returns_decoding_error() {
+        let mut request = DecryptRequest::new();
+        request.dime = MessageField::some(DIME::new());
+        request.private_key = b"bogus stuff".to_vec();
+
+        decrypt_dime_inner(request).unwrap_err();
     }
 }

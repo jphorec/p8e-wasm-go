@@ -3,6 +3,7 @@ syntax = "proto3";
 package io.provenance.scope.encryption;
 
 import "util.proto";
+import "encryption.proto";
 
 message EncryptRequest {
     UUID uuid = 1;
@@ -10,4 +11,17 @@ message EncryptRequest {
     bytes owner_public_key = 3;
     repeated bytes audience_public_key = 4;
     map<string, string> metadata = 5;
+}
+
+message EncryptResponse {
+    DIME dime = 1;
+}
+
+message DecryptRequest {
+    DIME dime = 1;
+    bytes private_key = 2;
+}
+
+message DecryptResponse {
+    bytes payload = 1;
 }
