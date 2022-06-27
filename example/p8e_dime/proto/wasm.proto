@@ -3,25 +3,30 @@ syntax = "proto3";
 package io.provenance.scope.encryption;
 
 import "util.proto";
-import "encryption.proto";
 
 message EncryptRequest {
-    UUID uuid = 1;
-    bytes payload = 2;
-    bytes owner_public_key = 3;
-    repeated bytes audience_public_key = 4;
-    map<string, string> metadata = 5;
+    bytes payload = 1; // raw bytes of the data to encrypt (not base64-encoded)
+    repeated bytes audience_public_key = 2; // list of all public keys (asn.1/sec1 encoding, not base64-encoded) to create audience DEK entries for
 }
 
 message EncryptResponse {
-    DIME dime = 1;
+    bytes encrypted_payload = 1; // encrypted payload provided in request
+    repeated Audience audience = 2; // list of audience member protos containing necessary information for payload decryption using corresponding private keys
 }
 
 message DecryptRequest {
-    DIME dime = 1;
-    bytes private_key = 2;
+    bytes encrypted_payload = 1; // the encrypted payload (not base64-encoded, though the encrypted contents may be)
+    Audience audience = 2; // the audience proto corresponding to the provided private key containing the necessary information for decryption
+    bytes private_key = 3; // the private key to use in conjunction with the provided audience in order to decrypt the provided encrypted payload
 }
 
 message DecryptResponse {
-    bytes payload = 1;
+    bytes payload = 1; // the raw payload, not base64-encoded
+}
+
+message Audience {
+    bytes public_key = 1; // public key, asn.1 / sec1 encoding, not base64-encoded (raw bytes)
+    bytes tag = 2; // Message Authentication Code/MAC
+    bytes ephemeral_pubkey = 3; // ephemeral public key generated for audience member at time of encryption, asn.1 / sec1 encoding, not base64-encoded (raw bytes)
+    bytes encrypted_dek = 4; // encrypted AES key, encrypted with derived secret from audience member and ephemeral key pair combo using diffie-hellman key-exchange, not base64-encoded, though the encrypted key itself is
 }

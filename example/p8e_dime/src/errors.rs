@@ -1,14 +1,14 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum DIMEError {
-    #[error("Unspecified DIME Error")]
+pub enum P8eEncryptionError {
+    #[error("Unspecified p8e encryption error")]
     Unspecified,
-    #[error("DIME encryption error")]
+    #[error("Encryption error")]
     EncryptionError,
-    #[error("DIME decryption error")]
+    #[error("Decryption error")]
     DecryptionError,
-    #[error("DIME HKDF Key Derivation error")]
+    #[error("HKDF key derivation error")]
     HkdfError,
     #[error("Error decoding the public key")]
     PublicKeyDecodingError,
