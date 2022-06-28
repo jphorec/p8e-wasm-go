@@ -488,13 +488,55 @@ mod tests {
 
     #[test]
     fn decrypt_from_node_js_example() {
-        let plaintext = b"Hello World!Hello World!Hello World!Hello World!";
-        let private_key_bytes =
-            base64::decode("vunkS5CB+Q2Pbi0ySLOTI0iD49wCPqHHNFfaDTk4iY8=").unwrap();
-        let member_id = "8b96e47a-f046-4ca8-bd1c-04b1a37e3475".as_bytes();
-        let ephemeral_public_key_bytes = base64::decode("BAJdqCnxVk41DjtdV4c3oz32q8aHnbSAA4L6eYwbU0aRNf5kwgpxzjZ37bqXnrSJdF8sWoADeCTKQ43srG5FG8w=").unwrap();
-        let tag = base64::decode("AAAADAAAAAAAAAAAAAAAAARtiJ6Fsn59QmLPaQpfxH2sPveWFyInfSxNM98yN1JtWp4Cl0LhB1kOkdJq+HmVUw==").unwrap();
-        let ciphertext = base64::decode("AAAADAAAAAAAAAAAAAAAAJgoosk1IhNczHOsuWUsXtf/PPXBBJRIfx68tx9+Bi2CwpoO9OtICMwC7BLfovSNXh1Jqb6wQaGjwqv2IdPR4C4=").unwrap();
+        nodejs_test(
+    "Hello World!Hello World!Hello World!Hello World!",
+        "8b96e47a-f046-4ca8-bd1c-04b1a37e3475",
+        "vunkS5CB+Q2Pbi0ySLOTI0iD49wCPqHHNFfaDTk4iY8=",
+        "BAJdqCnxVk41DjtdV4c3oz32q8aHnbSAA4L6eYwbU0aRNf5kwgpxzjZ37bqXnrSJdF8sWoADeCTKQ43srG5FG8w=",
+        "AAAADAAAAAAAAAAAAAAAAARtiJ6Fsn59QmLPaQpfxH2sPveWFyInfSxNM98yN1JtWp4Cl0LhB1kOkdJq+HmVUw==",
+        "AAAADAAAAAAAAAAAAAAAAJgoosk1IhNczHOsuWUsXtf/PPXBBJRIfx68tx9+Bi2CwpoO9OtICMwC7BLfovSNXh1Jqb6wQaGjwqv2IdPR4C4=",
+        );
+    }
+
+    // This doesn't decrypt in node js but works fine in kotlin/rust
+    #[test]
+    fn decrypt_from_node_js_example_1() {
+        nodejs_test(
+            "0qfSlYLBfe4nHcdLRGtduLk+THNtLJjG2tJKXIVnyf8=",
+            "9954804b-3044-4867-8569-6464d74bc8dc",
+            "3aTCPoNkrszooOadNgFv1JnweFrgjNmAlWKIdBemssA=",
+            "BA/Uc7FcQSIbBMCydrxjLx2SaoDsTvvIG3DiIB8wg2oTGgWAIaH+xaSknJI+QW8l4Bls6dMz95hh1HA+Pi/0PAY=",
+            "AAAADAAAAAAAAAAAAAAAAEjZgP9fOJui0vOlZzRihTmFi0eYvrGE5MY1sWrAjULPFYw+6Coc81abOC2W/R+Q5Q==",
+            "AAAADMwhxOhsm998Bp3x5LCQCrYx5o+4YDiUms2Lhd5fCvqRnt7KNOd0qyvLBZKJly91Q+ViZ6qcbYTY/GUvhVg4Q6h/8HJtgaTEig==",
+        );
+    }
+
+    // This doesn't decrypt in node js but works fine in kotlin/rust
+    #[test]
+    fn decrypt_from_node_js_example_2() {
+        nodejs_test(
+            "OqIbhjSmZwdMLMCyx3ehG0t73IsTBLFeIkL7Z3Xlgs0=",
+            "deadbeef-d00d-8675-3099-d00dd00dd00d",
+            "3aTCPoNkrszooOadNgFv1JnweFrgjNmAlWKIdBemssA=",
+            "BMJewTG04KHQmthpZtx6bNvTMswjyMrHsXXbRDRd+PsGPU/PWkuhAGTGo5P43/d5VX5Oi+cZTCNLaFM02oZnVaw=",
+            "AAAADAAAAAAAAAAAAAAAAJXqTw4K+NB7G17PgeIfbb+YqtTMcpm5Lj8OpFsFkfvpyDNJcIcxTPIJee94YkGLiA==",
+            "AAAADAHBJFQqzzikQOapAsVGlwZ+f7omYpaxA/rgNgbrFR1nJS/GnJ0rF+FcavCYTS51EuOvRKVruI551UOaaUV2GpjD2yYD6rqgFA==",
+        );
+    }
+
+    fn nodejs_test(
+        plaintext: &str,
+        member_id: &str,
+        private_key: &str,
+        ephemeral_public_key: &str,
+        tag: &str,
+        ciphertext: &str,
+    ) {
+        let member_id = member_id.as_bytes();
+        let private_key_bytes = base64::decode(private_key).unwrap();
+        let ephemeral_public_key_bytes = base64::decode(ephemeral_public_key).unwrap();
+        let tag = base64::decode(tag).unwrap();
+        let ciphertext = base64::decode(ciphertext).unwrap();
 
         let private_key = SecretKey::from_be_bytes(&private_key_bytes).unwrap();
         let ephemeral_public_key = PublicKey::from_sec1_bytes(&ephemeral_public_key_bytes).unwrap();
@@ -508,7 +550,6 @@ mod tests {
         )
         .unwrap();
 
-        // let response = p8e_decrypt_inner(decrypt_request).unwrap();
-        assert_eq!(plaintext.to_vec(), decrypted_plaintext);
+        assert_eq!(plaintext.as_bytes().to_vec(), decrypted_plaintext);
     }
 }
