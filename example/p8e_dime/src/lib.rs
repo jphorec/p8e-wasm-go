@@ -1,7 +1,7 @@
 use std::panic::catch_unwind;
 
 use aes_gcm::{
-    aead::{Aead, NewAead},
+    aead::{Aead, NewAead, Payload},
     Aes256Gcm, Key, Nonce,
 };
 use ecdsa::elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint};
@@ -63,7 +63,7 @@ where
 
 fn p8e_encrypt_inner(request: EncryptRequest) -> Result<EncryptResponse, P8eEncryptionError> {
     let key = generate_encryption_key();
-    let cipher_text = encrypt(&request.payload, &key, false)?;
+    let cipher_text = encrypt(&request.payload, &key, Some(&random_iv()?), None)?; // todo: additional authenticated data?
 
     // base64 encoding the DEK before encrypting for each audience member, for legacy compatability reasons
     let base64_key = base64(&key);
@@ -87,20 +87,72 @@ fn p8e_decrypt_inner(request: DecryptRequest) -> Result<DecryptResponse, P8eEncr
     let private_key = SecretKey::from_be_bytes(&private_key_bytes)
         .map_err(|_| P8eEncryptionError::PrivateKeyDecodingError)?;
     let audience_member = request.audience.unwrap();
+    let ephemeral_public_key =
+        PublicKey::from_sec1_bytes(&audience_member.ephemeral_pubkey).unwrap();
 
+    let dek_base64 = ecies_decrypt(
+        private_key,
+        ephemeral_public_key,
+        &audience_member.encrypted_dek,
+        None,
+        audience_member.tag.try_into()?,
+    )?;
+    // data encryption key is base64 encoded for legacy reasons
+    let plaintext = decrypt(&request.encrypted_payload, &unbase64(&dek_base64), None)?;
+
+    let mut response = DecryptResponse::new();
+    response.payload = plaintext;
+
+    Ok(response)
+}
+
+struct HmacVerification {
+    pub tag: Vec<u8>,
+    pub initialization_vector: Vec<u8>,
+}
+
+impl TryFrom<Vec<u8>> for HmacVerification {
+    type Error = P8eEncryptionError;
+
+    fn try_from(tag: Vec<u8>) -> Result<Self, Self::Error> {
+        let mut nonce_length = [0u8; 4];
+        nonce_length.copy_from_slice(&tag[0..4]);
+        let nonce_length: usize = u32::from_be_bytes(nonce_length)
+            .try_into()
+            .map_err(|_| P8eEncryptionError::DecryptionError)?;
+
+        let initialization_vector = &tag[4..nonce_length + 4];
+
+        Ok(Self {
+            tag: tag.to_vec(),
+            initialization_vector: initialization_vector.to_vec(),
+        })
+    }
+}
+
+fn ecies_decrypt(
+    private_key: SecretKey,
+    ephemeral_public_key: PublicKey,
+    encrypted_payload: &[u8],
+    additional_authenticated_data: Option<&[u8]>,
+    hmac_verification: HmacVerification,
+) -> Result<Vec<u8>, P8eEncryptionError> {
     let secret = diffie_hellman(
         private_key.to_nonzero_scalar(),
-        PublicKey::from_sec1_bytes(&&audience_member.ephemeral_pubkey)
-            .unwrap()
-            .as_affine(),
+        ephemeral_public_key.as_affine(),
     );
 
     let derived_key = hkdf_derive(64, None, secret.raw_secret_bytes(), &[])?;
 
     let (enc_key, mac_key) = derived_key.split_at(32);
 
-    let mac = encrypt(mac_key, enc_key, true)?;
-    let tag_bytes = audience_member.tag;
+    let mac = encrypt(
+        mac_key,
+        enc_key,
+        Some(&hmac_verification.initialization_vector),
+        additional_authenticated_data,
+    )?;
+    let tag_bytes = hmac_verification.tag;
     assert_eq!(
         tag_bytes,
         mac,
@@ -109,14 +161,8 @@ fn p8e_decrypt_inner(request: DecryptRequest) -> Result<DecryptResponse, P8eEncr
         mac.len()
     );
 
-    let dek_base64 = decrypt(&audience_member.encrypted_dek, enc_key)?;
-    // data encryption key is base64 encoded for legacy reasons
-    let plaintext = decrypt(&request.encrypted_payload, &unbase64(&dek_base64))?;
-
-    let mut response = DecryptResponse::new();
-    response.payload = plaintext;
-
-    Ok(response)
+    let plaintext_payload = decrypt(encrypted_payload, enc_key, additional_authenticated_data)?;
+    Ok(plaintext_payload)
 }
 
 fn unbase64(base64_bytes: &[u8]) -> Vec<u8> {
@@ -127,22 +173,37 @@ fn base64(bytes: &[u8]) -> Vec<u8> {
     base64::encode(bytes).into()
 }
 
+fn zero_iv() -> [u8; 12] {
+    [0u8; NONCE_LENGTH]
+}
+
+fn random_iv() -> Result<[u8; 12], P8eEncryptionError> {
+    let mut nonce_buffer = [0u8; NONCE_LENGTH];
+    RANDOM
+        .fill(&mut nonce_buffer)
+        .map_err(|_| P8eEncryptionError::Unspecified)?;
+    Ok(nonce_buffer)
+}
+
 const NONCE_LENGTH: usize = 12;
 fn encrypt(
     payload: &[u8],
     encryption_key: &[u8],
-    zero_iv: bool,
+    initialization_vector: Option<&[u8]>,
+    additional_authenticated_data: Option<&[u8]>,
 ) -> Result<Vec<u8>, P8eEncryptionError> {
     // encrypt payload with DEK
     let key = Key::from_slice(encryption_key);
     let cipher = Aes256Gcm::new(key);
-    let mut nonce_buffer = [0u8; NONCE_LENGTH];
-    if !zero_iv {
-        RANDOM
-            .fill(&mut nonce_buffer)
-            .map_err(|_| P8eEncryptionError::Unspecified)?;
-    }
-    let nonce = Nonce::from_slice(&nonce_buffer);
+    let riv = random_iv().unwrap();
+    let nonce_buffer = initialization_vector.unwrap_or(&riv);
+    let nonce = Nonce::from_slice(nonce_buffer);
+
+    let payload = Payload {
+        msg: payload,
+        aad: additional_authenticated_data.unwrap_or(&[]),
+    };
+
     let ciphertext = cipher
         .encrypt(nonce, payload)
         .map_err(|_| P8eEncryptionError::EncryptionError)?;
@@ -158,21 +219,18 @@ fn encrypt(
     buffer.extend(nonce_buffer);
     buffer.extend(ciphertext);
     Ok(buffer)
-    // if !zero_iv { // todo: what is up with the mismatch on whether the length is in the encrypted data in encrypt/decrypt kotlin-land?
-    // } else {
-    //     // place NONCE_LENGTH zero buffer before ciphertext
-    //     let mut buffer = nonce_buffer.to_vec();
-    //     buffer.extend(ciphertext);
-    //     Ok(buffer)
-    // }
 }
 
-fn decrypt(ciphertext: &[u8], encryption_key: &[u8]) -> Result<Vec<u8>, P8eEncryptionError> {
+fn decrypt(
+    ciphertext: &[u8],
+    encryption_key: &[u8],
+    additional_authenticated_data: Option<&[u8]>,
+) -> Result<Vec<u8>, P8eEncryptionError> {
     // decrypt payload with DEK
     let key = Key::from_slice(encryption_key);
     let cipher = Aes256Gcm::new(key);
+
     let mut nonce_length = [0u8; 4];
-    println!("ciphertext len {}", ciphertext.len());
     nonce_length.copy_from_slice(&ciphertext[0..4]);
     let nonce_length: usize = u32::from_be_bytes(nonce_length)
         .try_into()
@@ -183,8 +241,14 @@ fn decrypt(ciphertext: &[u8], encryption_key: &[u8]) -> Result<Vec<u8>, P8eEncry
     // Nonce::from_slice panics if the slice isn't valid, catch_unwind allows converting this to a Result
     let nonce = catch_unwind(|| Nonce::from_slice(&nonce_buffer))
         .map_err(|_| P8eEncryptionError::DecryptionError)?;
+
+    let payload = Payload {
+        msg: ciphertext,
+        aad: additional_authenticated_data.unwrap_or(&[]),
+    };
+
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(nonce, payload)
         .map_err(|_| P8eEncryptionError::DecryptionError)?;
 
     // return decrypted data
@@ -211,8 +275,8 @@ fn get_audience(audience_public_key: &[u8], key: &[u8]) -> Result<Audience, P8eE
 
     let (enc_key, mac_key) = derived_key.split_at(32);
 
-    let tag = encrypt(mac_key, enc_key, true)?;
-    let encrypted_key = encrypt(key, &enc_key, false)?;
+    let tag = encrypt(mac_key, enc_key, Some(&zero_iv()), None)?;
+    let encrypted_key = encrypt(key, &enc_key, Some(&random_iv()?), None)?;
 
     let mut audience = Audience::new();
 
@@ -260,17 +324,13 @@ fn hkdf_derive(
 #[cfg(test)]
 mod tests {
     use crate::{
-        base64, decrypt, encrypt, hkdf_derive, p8e_decrypt_inner, p8e_encrypt_inner,
-        proto::{
-            self,
-            util::UUID,
-            wasm::{Audience, DecryptRequest, EncryptRequest},
-        },
-        unbase64,
+        decrypt, ecies_decrypt, encrypt, hkdf_derive, p8e_decrypt_inner, p8e_encrypt_inner,
+        proto::wasm::{Audience, DecryptRequest, EncryptRequest},
+        random_iv, unbase64, zero_iv,
     };
     use aes_gcm::{aead::NewAead, Aes256Gcm, Key};
     use ecdsa::elliptic_curve::sec1::ToEncodedPoint;
-    use k256::SecretKey;
+    use k256::{PublicKey, SecretKey};
     use protobuf::MessageField;
 
     #[test]
@@ -350,8 +410,8 @@ mod tests {
         Aes256Gcm::new(key);
 
         let plaintext = b"hello there";
-        let ciphertext = encrypt(plaintext, key, false).unwrap();
-        let decrypted = decrypt(&ciphertext, key).unwrap();
+        let ciphertext = encrypt(plaintext, key, Some(&random_iv().unwrap()), None).unwrap();
+        let decrypted = decrypt(&ciphertext, key, None).unwrap();
 
         assert_eq!(plaintext, decrypted.as_slice());
     }
@@ -363,8 +423,8 @@ mod tests {
         Aes256Gcm::new(key);
 
         let plaintext = b"hello there";
-        let ciphertext = encrypt(plaintext, key, true).unwrap();
-        let decrypted = decrypt(&ciphertext, key).unwrap();
+        let ciphertext = encrypt(plaintext, key, Some(&zero_iv()), None).unwrap();
+        let decrypted = decrypt(&ciphertext, key, None).unwrap();
 
         assert_eq!(plaintext, decrypted.as_slice());
     }
@@ -426,49 +486,29 @@ mod tests {
         bytes[4 + length..].to_vec() //skip length and data
     }
 
-    // #[test]
-    // fn decrypt_from_node_js_example() {
-    //     let plaintext = b"Hello World!Hello World!Hello World!Hello World!";
-    //     let private_key_bytes =
-    //         base64::decode("vunkS5CB+Q2Pbi0ySLOTI0iD49wCPqHHNFfaDTk4iY8=").unwrap();
-    //     let public_key_bytes = SecretKey::from_be_bytes(&private_key_bytes)
-    //         .unwrap()
-    //         .public_key()
-    //         .to_encoded_point(false)
-    //         .as_bytes()
-    //         .to_vec();
-    //     let ephemeral_public_key = base64::decode("BAJdqCnxVk41DjtdV4c3oz32q8aHnbSAA4L6eYwbU0aRNf5kwgpxzjZ37bqXnrSJdF8sWoADeCTKQ43srG5FG8w=").unwrap();
-    //     let tag = base64::decode("AAAADAAAAAAAAAAAAAAAAARtiJ6Fsn59QmLPaQpfxH2sPveWFyInfSxNM98yN1JtWp4Cl0LhB1kOkdJq+HmVUw==").unwrap();
-    //     let ciphertext = base64::decode("AAAADAAAAAAAAAAAAAAAAJgoosk1IhNczHOsuWUsXtf/PPXBBJRIfx68tx9+Bi2CwpoO9OtICMwC7BLfovSNXh1Jqb6wQaGjwqv2IdPR4C4=").unwrap();
+    #[test]
+    fn decrypt_from_node_js_example() {
+        let plaintext = b"Hello World!Hello World!Hello World!Hello World!";
+        let private_key_bytes =
+            base64::decode("vunkS5CB+Q2Pbi0ySLOTI0iD49wCPqHHNFfaDTk4iY8=").unwrap();
+        let member_id = "8b96e47a-f046-4ca8-bd1c-04b1a37e3475".as_bytes();
+        let ephemeral_public_key_bytes = base64::decode("BAJdqCnxVk41DjtdV4c3oz32q8aHnbSAA4L6eYwbU0aRNf5kwgpxzjZ37bqXnrSJdF8sWoADeCTKQ43srG5FG8w=").unwrap();
+        let tag = base64::decode("AAAADAAAAAAAAAAAAAAAAARtiJ6Fsn59QmLPaQpfxH2sPveWFyInfSxNM98yN1JtWp4Cl0LhB1kOkdJq+HmVUw==").unwrap();
+        let ciphertext = base64::decode("AAAADAAAAAAAAAAAAAAAAJgoosk1IhNczHOsuWUsXtf/PPXBBJRIfx68tx9+Bi2CwpoO9OtICMwC7BLfovSNXh1Jqb6wQaGjwqv2IdPR4C4=").unwrap();
 
-    //     let mut payload = Payload::new();
-    //     payload.id = 0;
-    //     payload.cipher_text = base64(&ciphertext);
+        let private_key = SecretKey::from_be_bytes(&private_key_bytes).unwrap();
+        let ephemeral_public_key = PublicKey::from_sec1_bytes(&ephemeral_public_key_bytes).unwrap();
 
-    //     let mut owner_audience = Audience::new();
-    //     owner_audience.public_key = base64(&public_key_bytes);
-    //     owner_audience.context = ContextType::RETRIEVAL.into();
-    //     owner_audience.payload_id = 0;
-    //     owner_audience.tag = base64(&tag);
-    //     owner_audience.ephemeral_pubkey = base64(&ephemeral_public_key);
-    //     // owner_audience.encrypted_dek = // todo: calculate this beforehand from audience private key and ephemeral public key? Isn't that just used for secret used to decrypt dek itself?
+        let decrypted_plaintext = ecies_decrypt(
+            private_key,
+            ephemeral_public_key,
+            &ciphertext,
+            Some(member_id),
+            tag.try_into().unwrap(),
+        )
+        .unwrap();
 
-    //     let mut dime = DIME::new();
-    //     dime.payload = vec![payload];
-    //     dime.owner = MessageField::some(owner_audience.clone());
-    //     dime.audience = vec![owner_audience];
-    //     let mut uuid = UUID::new();
-    //     uuid.value = Uuid::new_v4().to_string();
-    //     dime.uuid = MessageField::some(uuid);
-
-    //     let mut decrypt_request = DecryptRequest::new();
-    //     decrypt_request.dime = MessageField::some(dime);
-    //     decrypt_request.private_key = private_key_bytes;
-
-    //     // let response = decrypt(&ciphertext, &private_key_bytes, true).unwrap();
-    //     // assert_eq!(plaintext.to_vec(), response);
-
-    //     let response = p8e_decrypt_inner(decrypt_request).unwrap();
-    //     assert_eq!(plaintext.to_vec(), response.payload);
-    // }
+        // let response = p8e_decrypt_inner(decrypt_request).unwrap();
+        assert_eq!(plaintext.to_vec(), decrypted_plaintext);
+    }
 }
